@@ -1,0 +1,27 @@
+{
+  "name": "atomic-command-center-backend",
+  "version": "1.0.0",
+  "description": "Backend for Atomic Command Center",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "whatsapp-web.js": "^1.23.0",
+    "qrcode-terminal": "^0.12.0",
+    "openai": "^4.0.0",
+    "mongoose": "^7.0.0",
+    "dotenv": "^16.0.0",
+    "cors": "^2.8.5",
+    "socket.io": "^4.6.0",
+    "node-cron": "^3.0.2",
+    "fluent-ffmpeg": "^2.1.2",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  }
+}
