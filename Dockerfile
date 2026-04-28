@@ -1,11 +1,15 @@
 FROM node:18-bullseye-slim
 
-# Install dependencies required by Puppeteer/Chromium for WhatsApp Web JS
+# Install Chromium and all required system dependencies for Puppeteer/whatsapp-web.js
 RUN apt-get update && apt-get install -y \
-    gconf-service \
+    chromium \
+    ca-certificates \
+    fonts-liberation \
+    fonts-noto-color-emoji \
     libgbm-dev \
     libasound2 \
     libatk1.0-0 \
+    libatk-bridge2.0-0 \
     libc6 \
     libcairo2 \
     libcups2 \
@@ -13,11 +17,11 @@ RUN apt-get update && apt-get install -y \
     libexpat1 \
     libfontconfig1 \
     libgcc1 \
-    libgconf-2-4 \
     libgdk-pixbuf2.0-0 \
     libglib2.0-0 \
     libgtk-3-0 \
     libnspr4 \
+    libnss3 \
     libpango-1.0-0 \
     libpangocairo-1.0-0 \
     libstdc++6 \
@@ -34,22 +38,18 @@ RUN apt-get update && apt-get install -y \
     libxrender1 \
     libxss1 \
     libxtst6 \
-    ca-certificates \
-    fonts-liberation \
-    libappindicator1 \
-    libnss3 \
     lsb-release \
-    xdg-utils \
     wget \
-    chromium \
+    xdg-utils \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Configure Puppeteer to use the installed Chromium
+# Tell Puppeteer to skip downloading Chromium (use system one)
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+ENV DISPLAY=:99
 
 COPY package*.json ./
 RUN npm install --production
