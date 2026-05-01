@@ -10,6 +10,8 @@ const { OpenAI } = require('openai');
 const Message = require('./models/Message');
 const Plan = require('./models/Plan');
 const User = require('./models/User');
+const ChatContext = require('./models/ChatContext');
+const SystemContext = require('./models/SystemContext');
 
 const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
@@ -57,14 +59,64 @@ io.on('connection', (socket) => {
 
 // --- Lógica de IA ---
 
+const summarizeContexts = async (accountId, chatId, unsummarizedHistory, oldSummary) => {
+    const sysPrompt = `Actúas como un sintetizador de memoria para ventas. Tienes un resumen anterior de la conversación y nuevos mensajes. 
+Tu tarea es generar un nuevo resumen global actualizado de toda la conversación (qué quiere el cliente, contexto, estado actual). 
+El resumen debe ser conciso, directo y enfocado en ventas. No debe exceder las 150 palabras.`;
+    const userPrompt = `Resumen anterior: ${oldSummary}\nNuevos mensajes a incorporar:\n${unsummarizedHistory}`;
+    try {
+        const completion = await openai.chat.completions.create({
+            model: AI_MODEL,
+            messages: [{ role: "system", content: sysPrompt }, { role: "user", content: userPrompt }]
+        });
+        return completion.choices[0].message.content;
+    } catch(e) {
+        return oldSummary;
+    }
+}
+
 const triggerOpenAI = async (accountId, chatId, msgBody, tone = 'balanced') => {
     try {
         console.log(`IA analizando mensaje (${tone}) de ${chatId}...`);
 
         const activePlan = await Plan.findOne({ isActive: true }) || { content: "Foco en cierre de ventas y amabilidad." };
-        const user = await User.findOne({ role: 'MASTER_ADMIN' }) || { botName: "Zura", naturalContext: "Profesional y cercano" };
-        const recentMessages = await Message.find({ chatId }).sort({ timestamp: -1 }).limit(10);
-        const history = recentMessages.reverse().map(m => `${m.from === 'me' ? 'Tú' : 'Cliente'}: ${m.body}`).join('\n');
+        
+        let user;
+        try {
+            if (accountId !== 'corporate_main') {
+                user = await User.findById(accountId);
+            }
+        } catch (e) {}
+        
+        if (!user) {
+            user = await User.findOne({ role: 'MASTER_ADMIN' }) || { botName: "Zura", naturalContext: "Profesional y cercano" };
+        }
+        
+        let sysCtx = await SystemContext.findOne({ accountId });
+        if (!sysCtx) sysCtx = await SystemContext.create({ accountId });
+        
+        let chatCtx = await ChatContext.findOne({ chatId });
+        if (!chatCtx) chatCtx = await ChatContext.create({ accountId, chatId });
+
+        const unsummarized = await Message.find({ chatId, summarized: { $ne: true } }).sort({ timestamp: 1 });
+        if (unsummarized.length > 10) {
+            const historyToSummarize = unsummarized.map(m => `${m.from === accountId ? 'Tú' : 'Cliente'}: ${m.body}`).join('\n');
+            
+            // Marcar inmediatamente para no re-procesar
+            const unsummarizedIds = unsummarized.map(u => u._id);
+            await Message.updateMany({ _id: { $in: unsummarizedIds } }, { $set: { summarized: true } });
+
+            // BACKGROUND SUMMARIZATION (Fire and forget)
+            summarizeContexts(accountId, chatId, historyToSummarize, chatCtx.summary).then(async (newSummary) => {
+                chatCtx.summary = newSummary;
+                chatCtx.lastUpdated = new Date();
+                await chatCtx.save();
+                console.log(`[BACKGROUND] Memoria consolidada para chat ${chatId}`);
+            }).catch(e => console.error("[BACKGROUND] Error resumiendo:", e));
+        }
+
+        const recentMessages = await Message.find({ chatId }).sort({ timestamp: -1 }).limit(15);
+        const realHistory = recentMessages.reverse().map(m => `${m.from === accountId ? 'Tú' : 'Cliente'}: ${m.body}`).join('\n');
 
         let toneInstruction = "Mantén un tono equilibrado y profesional.";
         if (tone === 'friendly') toneInstruction = "Sé extremadamente amable, empático y usa un lenguaje cálido. Usa algunos emojis sutiles.";
@@ -72,25 +124,29 @@ const triggerOpenAI = async (accountId, chatId, msgBody, tone = 'balanced') => {
 
         const systemPrompt = `
             Eres ${user.botName}, asistente de IA.
-            CONTEXTO: ${user.naturalContext}
-            ESTRATEGIA: ${activePlan.content}
-            TONO ESPECÍFICO: ${toneInstruction}
+            CONTEXTO DEL ASESOR: ${user.naturalContext}
+            CONTEXTO GLOBAL DEL SISTEMA: ${sysCtx.globalSummary}
+            ESTRATEGIA ACTIVA: ${activePlan.content}
+            TONO ESPECÍFICO A USAR: ${toneInstruction}
 
-            HISTORIAL:
-            ${history}
+            CONTEXTO RESUMIDO DE LA CONVERSACIÓN HASTA AHORA:
+            ${chatCtx.summary}
 
-            TAREA: Genera la mejor respuesta para Santiago. Solo devuelve el texto de la sugerencia.
+            HISTORIAL REAL RECIENTE (Últimos mensajes para fluidez):
+            ${realHistory}
+
+            TAREA: Genera la mejor respuesta para el cliente. Solo devuelve el texto de la sugerencia, listo para copiarse.
         `;
 
         const completion = await openai.chat.completions.create({
             model: AI_MODEL,
-            messages: [{ role: "system", content: systemPrompt }, { role: "user", content: msgBody }]
+            messages: [{ role: "system", content: systemPrompt }, { role: "user", content: `Nuevo mensaje: ${msgBody}` }]
         });
 
         const suggestion = completion.choices[0].message.content;
 
         if (tone === 'balanced') {
-            await Message.create({ accountId, chatId, from: chatId, body: msgBody, aiSuggestion: suggestion });
+            await Message.create({ accountId, chatId, from: chatId, body: msgBody, aiSuggestion: suggestion, summarized: false });
         }
 
         io.emit('new_activity', {

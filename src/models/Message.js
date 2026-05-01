@@ -8,7 +8,8 @@ const MessageSchema = new mongoose.Schema({
     timestamp: { type: Date, default: Date.now },
     type: { type: String, enum: ['incoming', 'outgoing'], default: 'incoming' },
     aiSuggestion: { type: String },
-    status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' }
+    status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
+    summarized: { type: Boolean, default: false }
 });
 
 module.exports = mongoose.model('Message', MessageSchema);
