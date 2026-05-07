@@ -10,8 +10,6 @@ const { OpenAI } = require('openai');
 const Message = require('./models/Message');
 const Plan = require('./models/Plan');
 const User = require('./models/User');
-const ChatContext = require('./models/ChatContext');
-const SystemContext = require('./models/SystemContext');
 
 const authRoutes = require('./routes/auth');
 const adminRoutes = require('./routes/admin');
@@ -51,72 +49,31 @@ const clients = {};
 const qrCodes = {};
 const focusedChats = {};
 
+const clientStatus = {};
+
 // --- Socket.io ---
 io.on('connection', (socket) => {
     console.log('New client connected');
+    // Replay any existing QR codes to newly connected clients
+    Object.keys(qrCodes).forEach(id => {
+        if (qrCodes[id]) socket.emit('qr', { id, qr: qrCodes[id] });
+    });
+    Object.keys(clientStatus).forEach(id => {
+        if (clientStatus[id] === 'connected') socket.emit('ready', { id });
+    });
     socket.on('disconnect', () => console.log('Client disconnected'));
-});
+});;
 
 // --- Lógica de IA ---
-
-const summarizeContexts = async (accountId, chatId, unsummarizedHistory, oldSummary) => {
-    const sysPrompt = `Actúas como un sintetizador de memoria para ventas. Tienes un resumen anterior de la conversación y nuevos mensajes. 
-Tu tarea es generar un nuevo resumen global actualizado de toda la conversación (qué quiere el cliente, contexto, estado actual). 
-El resumen debe ser conciso, directo y enfocado en ventas. No debe exceder las 150 palabras.`;
-    const userPrompt = `Resumen anterior: ${oldSummary}\nNuevos mensajes a incorporar:\n${unsummarizedHistory}`;
-    try {
-        const completion = await openai.chat.completions.create({
-            model: AI_MODEL,
-            messages: [{ role: "system", content: sysPrompt }, { role: "user", content: userPrompt }]
-        });
-        return completion.choices[0].message.content;
-    } catch(e) {
-        return oldSummary;
-    }
-}
 
 const triggerOpenAI = async (accountId, chatId, msgBody, tone = 'balanced') => {
     try {
         console.log(`IA analizando mensaje (${tone}) de ${chatId}...`);
 
         const activePlan = await Plan.findOne({ isActive: true }) || { content: "Foco en cierre de ventas y amabilidad." };
-        
-        let user;
-        try {
-            if (accountId !== 'corporate_main') {
-                user = await User.findById(accountId);
-            }
-        } catch (e) {}
-        
-        if (!user) {
-            user = await User.findOne({ role: 'MASTER_ADMIN' }) || { botName: "Zura", naturalContext: "Profesional y cercano" };
-        }
-        
-        let sysCtx = await SystemContext.findOne({ accountId });
-        if (!sysCtx) sysCtx = await SystemContext.create({ accountId });
-        
-        let chatCtx = await ChatContext.findOne({ chatId });
-        if (!chatCtx) chatCtx = await ChatContext.create({ accountId, chatId });
-
-        const unsummarized = await Message.find({ chatId, summarized: { $ne: true } }).sort({ timestamp: 1 });
-        if (unsummarized.length > 10) {
-            const historyToSummarize = unsummarized.map(m => `${m.from === accountId ? 'Tú' : 'Cliente'}: ${m.body}`).join('\n');
-            
-            // Marcar inmediatamente para no re-procesar
-            const unsummarizedIds = unsummarized.map(u => u._id);
-            await Message.updateMany({ _id: { $in: unsummarizedIds } }, { $set: { summarized: true } });
-
-            // BACKGROUND SUMMARIZATION (Fire and forget)
-            summarizeContexts(accountId, chatId, historyToSummarize, chatCtx.summary).then(async (newSummary) => {
-                chatCtx.summary = newSummary;
-                chatCtx.lastUpdated = new Date();
-                await chatCtx.save();
-                console.log(`[BACKGROUND] Memoria consolidada para chat ${chatId}`);
-            }).catch(e => console.error("[BACKGROUND] Error resumiendo:", e));
-        }
-
-        const recentMessages = await Message.find({ chatId }).sort({ timestamp: -1 }).limit(15);
-        const realHistory = recentMessages.reverse().map(m => `${m.from === accountId ? 'Tú' : 'Cliente'}: ${m.body}`).join('\n');
+        const user = await User.findOne({ role: 'MASTER_ADMIN' }) || { botName: "Zura", naturalContext: "Profesional y cercano" };
+        const recentMessages = await Message.find({ chatId }).sort({ timestamp: -1 }).limit(10);
+        const history = recentMessages.reverse().map(m => `${m.from === 'me' ? 'Tú' : 'Cliente'}: ${m.body}`).join('\n');
 
         let toneInstruction = "Mantén un tono equilibrado y profesional.";
         if (tone === 'friendly') toneInstruction = "Sé extremadamente amable, empático y usa un lenguaje cálido. Usa algunos emojis sutiles.";
@@ -124,29 +81,25 @@ const triggerOpenAI = async (accountId, chatId, msgBody, tone = 'balanced') => {
 
         const systemPrompt = `
             Eres ${user.botName}, asistente de IA.
-            CONTEXTO DEL ASESOR: ${user.naturalContext}
-            CONTEXTO GLOBAL DEL SISTEMA: ${sysCtx.globalSummary}
-            ESTRATEGIA ACTIVA: ${activePlan.content}
-            TONO ESPECÍFICO A USAR: ${toneInstruction}
+            CONTEXTO: ${user.naturalContext}
+            ESTRATEGIA: ${activePlan.content}
+            TONO ESPECÍFICO: ${toneInstruction}
 
-            CONTEXTO RESUMIDO DE LA CONVERSACIÓN HASTA AHORA:
-            ${chatCtx.summary}
+            HISTORIAL:
+            ${history}
 
-            HISTORIAL REAL RECIENTE (Últimos mensajes para fluidez):
-            ${realHistory}
-
-            TAREA: Genera la mejor respuesta para el cliente. Solo devuelve el texto de la sugerencia, listo para copiarse.
+            TAREA: Genera la mejor respuesta para Santiago. Solo devuelve el texto de la sugerencia.
         `;
 
         const completion = await openai.chat.completions.create({
             model: AI_MODEL,
-            messages: [{ role: "system", content: systemPrompt }, { role: "user", content: `Nuevo mensaje: ${msgBody}` }]
+            messages: [{ role: "system", content: systemPrompt }, { role: "user", content: msgBody }]
         });
 
         const suggestion = completion.choices[0].message.content;
 
         if (tone === 'balanced') {
-            await Message.create({ accountId, chatId, from: chatId, body: msgBody, aiSuggestion: suggestion, summarized: false });
+            await Message.create({ accountId, chatId, from: chatId, body: msgBody, aiSuggestion: suggestion });
         }
 
         io.emit('new_activity', {
@@ -168,28 +121,70 @@ const triggerOpenAI = async (accountId, chatId, msgBody, tone = 'balanced') => {
 // --- Lógica de WhatsApp ---
 
 const initializeWhatsApp = (id) => {
+    console.log(`[INIT] Inicializando cliente WhatsApp para: ${id}`);
+    clientStatus[id] = 'initializing';
+    delete qrCodes[id];
+
     const client = new Client({
         authStrategy: new LocalAuth({ clientId: id }),
         puppeteer: {
+            executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
             handleSIGINT: false,
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-extensions', '--disable-dev-shm-usage']
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--disable-gpu',
+                '--window-size=1920,1080'
+            ]
         }
     });
 
-    client.on('qr', (qr) => io.emit('qr', { id, qr }));
+    client.on('qr', (qr) => {
+        console.log(`[QR] QR generado para ${id}`);
+        qrCodes[id] = qr;
+        clientStatus[id] = 'qr';
+        io.emit('qr', { id, qr });
+    });
+
+    client.on('loading_screen', (percent, message) => {
+        console.log(`[LOAD] ${id}: ${percent}% - ${message}`);
+    });
+
+    client.on('authenticated', () => {
+        console.log(`[AUTH] ${id} autenticado!`);
+        clientStatus[id] = 'authenticated';
+        delete qrCodes[id];
+    });
+
+    client.on('auth_failure', (msg) => {
+        console.error(`[AUTH_FAIL] ${id}:`, msg);
+        clientStatus[id] = 'disconnected';
+        delete qrCodes[id];
+    });
 
     client.on('ready', async () => {
-        console.log(`Client ${id} ready! Sincronizando...`);
+        console.log(`[READY] Client ${id} listo!`);
         clients[id] = client;
+        clientStatus[id] = 'connected';
+        delete qrCodes[id];
         io.emit('ready', { id });
 
-        // Sincronización inicial de chats en segundo plano
         try {
             const chats = await client.getChats();
-            console.log(`${id}: ${chats.length} chats sincronizados.`);
+            console.log(`[SYNC] ${id}: ${chats.length} chats sincronizados.`);
         } catch (e) {
             console.error("Error sync chats:", e);
         }
+    });
+
+    client.on('disconnected', (reason) => {
+        console.log(`[DISCONNECTED] ${id}: ${reason}`);
+        clientStatus[id] = 'disconnected';
+        delete clients[id];
+        delete qrCodes[id];
+        io.emit('disconnected', { id, reason });
     });
 
     client.on('message', async (msg) => {
@@ -197,15 +192,56 @@ const initializeWhatsApp = (id) => {
         await triggerOpenAI(id, msg.from, msg.body);
     });
 
-    client.initialize().catch(err => console.error(`Error init ${id}:`, err));
+    client.initialize().catch(err => {
+        console.error(`[ERROR] init ${id}:`, err);
+        clientStatus[id] = 'error';
+    });
 };
 
 // Endpoints
 app.post('/api/whatsapp/init', (req, res) => {
     const { id } = req.body;
+    if (!id) return res.status(400).json({ error: 'id required' });
     if (clients[id]) return res.json({ status: 'already_connected' });
+    if (clientStatus[id] === 'initializing' || clientStatus[id] === 'qr') {
+        return res.json({ status: clientStatus[id], qr: qrCodes[id] || null });
+    }
     initializeWhatsApp(id);
     res.json({ status: 'initializing' });
+});
+
+// Endpoint REST para obtener QR sin socket (polling fallback)
+app.get('/api/whatsapp/qr/:id', (req, res) => {
+    const { id } = req.params;
+    const status = clientStatus[id] || 'disconnected';
+    const qr = qrCodes[id] || null;
+    res.json({ status, qr });
+});
+
+// Endpoint para ver el QR como imagen directa (PNG)
+const QRCode = require('qrcode');
+app.get('/api/whatsapp/qr/:id/image', async (req, res) => {
+    const { id } = req.params;
+    const qr = qrCodes[id];
+    if (!qr) return res.status(404).send('QR not generated yet. Please wait or init node.');
+    
+    try {
+        const img = await QRCode.toBuffer(qr);
+        res.type('png');
+        res.send(img);
+    } catch (err) {
+        res.status(500).send('Error generating QR image');
+    }
+});
+
+// Endpoint de estado
+app.get('/api/whatsapp/status/:id', (req, res) => {
+    const { id } = req.params;
+    res.json({ 
+        status: clientStatus[id] || 'disconnected',
+        hasQR: !!qrCodes[id],
+        isConnected: !!clients[id]
+    });
 });
 
 app.get('/api/whatsapp/chats/:id', async (req, res) => {
@@ -242,6 +278,21 @@ app.get('/api/whatsapp/messages/:clientId/:chatId', async (req, res) => {
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
+});
+
+app.post('/api/whatsapp/reset', async (req, res) => {
+    const { id } = req.body;
+    if (clients[id]) {
+        try {
+            await clients[id].destroy();
+            delete clients[id];
+            console.log(`Client ${id} destroyed for reset.`);
+        } catch (e) {
+            console.error(`Error destroying client ${id}:`, e);
+        }
+    }
+    initializeWhatsApp(id);
+    res.json({ status: 'resetting' });
 });
 
 app.post('/api/ai/variant', async (req, res) => {
